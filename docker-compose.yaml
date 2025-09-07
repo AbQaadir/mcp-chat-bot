@@ -1,0 +1,142 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: pgvector_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: resumedb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    networks:
+      - app_network
+
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  celery:
+    build:
+      context: ./fastapi-server
+      dockerfile: Dockerfile
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    env_file:
+      - ./fastapi-server/.env
+    volumes:
+      - uploads_data:/tmp/resume_uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    networks:
+      - app_network
+
+  flower:
+    build:
+      context: ./fastapi-server
+      dockerfile: Dockerfile
+    command: celery -A app.worker.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    env_file:
+      - ./fastapi-server/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+      celery:
+        condition: service_started
+    networks:
+      - app_network
+    volumes:
+      - uploads_data:/tmp/resume_uploads
+
+  api:
+    build:
+      context: ./fastapi-server
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./fastapi-server/.env
+    volumes:
+      - uploads_data:/tmp/resume_uploads
+    depends_on:
+      - fastmcp-server
+      - redis
+      - db
+      
+    networks:
+      - app_network
+
+  fastmcp-server:
+    build:
+      context: ./fastmcp-server
+      dockerfile: Dockerfile
+    container_name: fastmcp-server
+    ports:
+      - "8005:8005"
+    env_file:
+      - ./fastmcp-server/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app_network
+
+  frontend:
+    build:
+      context: ./next-frontend
+      dockerfile: Dockerfile
+    container_name: next-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    networks:
+      - app_network
+    environment:
+      - NEXT_PUBLIC_API_URL=http://api:8000
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads_data:
+
+networks:
+  app_network:
+    driver: bridge
