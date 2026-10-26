@@ -1,137 +1,185 @@
-# AI-Powered Resume Processing & Chat System
+# MCP Applicant Tracking System: Chat With a Pile of Resumes
 
-A comprehensive full-stack application that combines resume processing, semantic search, and AI-powered chat capabilities. Built with modern microservices architecture using FastAPI, Next.js, and advanced AI technologies.
+*I built a system where you drop in a stack of PDF resumes and then simply ask questions about them, in plain English, like talking to a very fast recruiter's assistant.*
 
-## 🌟 Overview
+## TL;DR
 
-This system provides an intelligent resume processing platform where users can:
-- Upload PDF resumes for automated processing and analysis
-- Chat with an AI assistant about resume content using natural language
-- Perform semantic search across uploaded resumes
-- Leverage advanced language models for resume insights and recommendations
+- Upload many PDF resumes at once; they're processed in the background so the app never freezes.
+- Ask questions in a chat window ("Who has Python and cloud experience?") and get streamed, context-aware answers.
+- Under the hood: resumes become searchable "meaning fingerprints" (vector embeddings) stored in PostgreSQL with pgvector, and the AI reaches them through an MCP server.
+- The whole thing (frontend, API, workers, database, monitoring) starts with one `docker-compose up -d`.
 
-## 🏗️ Architecture
+## The problem
 
-The system follows a microservices architecture with the following components:
+Imagine you're hiring and 80 resumes land in your inbox. You don't want to open each PDF. You want to ask, "Who has worked with payment systems?" or "Show me people with leadership experience."
+
+Ctrl+F doesn't help much. Someone may write "built checkout and billing services" and never use the words "payment systems". Keyword search only matches exact words, while you care about meaning. And reading each resume by hand doesn't scale.
+
+I wanted something that lets you talk to your resumes instead of digging through them.
+
+## The idea
+
+Think of a librarian who has read every resume once and filed it by *what it's about*, not by the words it uses. When you ask a question, the librarian doesn't flip through every page. They walk to the shelf where that topic lives, pull out the relevant passages, and then explain them to you in a sentence or two.
+
+That's the system:
+
+1. **Reading and filing:** each uploaded PDF is read, cut into small passages, and turned into a numeric fingerprint of its meaning.
+2. **Finding:** your question gets a fingerprint too, and the closest passages are retrieved.
+3. **Explaining:** a language model (Google's Gemini) writes the answer using those passages, streaming it word by word.
+
+> **Plain-English glossary**
+> - **Embedding:** a list of numbers that captures the meaning of a piece of text. Similar meanings give similar numbers.
+> - **Semantic search:** searching by meaning rather than exact words.
+> - **MCP (Model Context Protocol):** a standard way for an AI to use outside tools, like a universal plug between an AI and your data.
+> - **Background worker:** a helper process that does slow jobs so the main app stays responsive.
+
+## How it works
+
+The journey has two halves: *getting resumes in* and *asking questions*.
+
+### Getting resumes in
 
 ```mermaid
-graph TB
-    %% User Layer
-    User[👤 User] --> Frontend
-    
-    %% Frontend Layer
-    Frontend[🌐 Next.js Frontend<br/>Port 3000] --> API
-    
-    %% API Layer
-    API[🖥️ FastAPI Server<br/>Port 8000] --> FastMCP
-    API --> Celery
-    API --> Redis
-    
-    %% MCP Layer
-    FastMCP[🔌 FastMCP Server<br/>Port 8005] --> DB
-    
-    %% Worker Layer
-    Celery[⚙️ Celery Worker<br/>Background Tasks] --> Redis
-    Celery --> DB
-    
-    %% Storage Layer
-    Redis[📦 Redis<br/>Port 6379<br/>Message Broker]
-    DB[(🗄️ PostgreSQL + pgvector<br/>Port 5432<br/>Vector Database)]
-    
-    %% Monitoring Layer
-    Flower[🌸 Flower<br/>Port 5555<br/>Task Monitor] --> Redis
-    PgAdmin[🔧 pgAdmin<br/>Port 5050<br/>DB Admin] --> DB
-    
-    %% Shared Storage
-    API -.-> Uploads[📁 Shared Upload Volume]
-    Celery -.-> Uploads
-    Flower -.-> Uploads
-    
-    %% Styling
-    classDef frontend fill:#e1f5fe
-    classDef backend fill:#f3e5f5
-    classDef storage fill:#e8f5e8
-    classDef monitoring fill:#fff3e0
-    
-    class Frontend frontend
-    class API,FastMCP backend
-    class Redis,DB,Uploads storage
-    class Flower,PgAdmin monitoring
+sequenceDiagram
+    participant U as User
+    participant F as Next.js Frontend
+    participant A as FastAPI Server
+    participant R as Redis
+    participant W as Celery Worker
+    participant D as PostgreSQL + pgvector
+
+    U->>F: Drop in PDF resumes
+    F->>A: Upload files
+    A->>R: Queue a processing task
+    A-->>F: Accepted, no waiting
+    R->>W: Hand task to worker
+    W->>W: Read PDF and split into chunks
+    W->>W: Create embeddings with Google Generative AI
+    W->>D: Store chunks and vectors
 ```
 
-## 🚀 Key Features
+When you upload, the API doesn't process the files itself. It saves them to a shared upload folder, drops a note in a queue (Redis), and immediately replies. A separate worker picks up the note, reads the PDF, splits the text into chunks, creates embeddings, and stores everything in the database. You can upload many files without the page hanging.
 
-### Resume Processing
-- **Multi-file PDF upload** with drag-and-drop interface
-- **Asynchronous processing** using Celery for scalability
-- **Intelligent text chunking** for optimal embedding generation
-- **Vector storage** in PostgreSQL with pgvector extension
-- **Semantic search** capabilities using Google Generative AI
+### Asking questions
 
-### AI Chat Interface
-- **Streaming chat responses** for real-time interaction
-- **Context-aware conversations** about uploaded resumes
-- **Model Context Protocol (MCP)** integration for advanced AI capabilities
-- **Markdown support** for rich text rendering
-- **Message history** persistence
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant F as Next.js Frontend
+    participant A as FastAPI Server
+    participant G as Gemini via LangChain
+    participant M as FastMCP Server
+    participant D as PostgreSQL + pgvector
 
-### System Management
-- **Docker containerization** for easy deployment
-- **Health checks** for service monitoring
-- **Flower dashboard** for Celery task monitoring
-- **pgAdmin** for database administration
-- **CORS support** for frontend-backend communication
+    U->>F: Ask a question
+    F->>A: Send chat message
+    A->>G: Question plus available MCP tools
+    G->>M: Call the search tool
+    M->>D: Find closest resume chunks
+    D-->>M: Matching passages
+    M-->>G: Passages as context
+    G-->>A: Answer, streamed
+    A-->>F: Streaming response
+    F-->>U: Markdown answer appears live
+```
 
-## 🛠️ Technology Stack
+The chat model doesn't have direct database access. Instead, the API gives it a toolbox served by a separate MCP server. When your question needs resume data, the model calls the search tool, gets back the most relevant passages, and writes an answer from them. The answer streams back so you see it appear as it's written.
 
-### Backend
-- **FastAPI** - Modern Python web framework
-- **Celery** - Asynchronous task queue
-- **Redis** - Message broker and caching
-- **PostgreSQL** - Primary database
-- **pgvector** - Vector similarity search
-- **LangChain** - AI/ML framework
-- **Google Generative AI** - Embeddings and language models
+> **For the curious:** the agent logic lives in `fastapi-server/app/agents/mcp_agent.py`, and the MCP server is a small FastMCP app (`fastmcp-server/server.py`) that connects to the same PostgreSQL database.
 
-### Frontend
-- **Next.js 15** - React framework with Turbopack
-- **TypeScript** - Type-safe development
-- **Tailwind CSS** - Utility-first styling
-- **React Markdown** - Rich text rendering
+## Under the hood
 
-### DevOps & Infrastructure
-- **Docker** & **Docker Compose** - Containerization
-- **Python 3.11+** - Backend runtime
-- **Node.js 20** - Frontend runtime
-- **UV** - Fast Python package installer
+### Architecture
 
-## 📦 Quick Start
+```mermaid
+flowchart TB
+    User[User] --> Frontend["Next.js Frontend - port 3000"]
+    Frontend --> API["FastAPI Server - port 8000"]
+    API --> MCP["FastMCP Server - port 8005"]
+    API --> Celery["Celery Worker - background tasks"]
+    API --> Redis["Redis - port 6379 - message broker"]
+    Celery --> Redis
+    MCP --> DB[("PostgreSQL + pgvector - port 5432")]
+    Celery --> DB
+    Flower["Flower - port 5555 - task monitor"] --> Redis
+    PgAdmin["pgAdmin - port 5050 - DB admin"] --> DB
+    API -.-> Uploads["Shared upload volume"]
+    Celery -.-> Uploads
+    Flower -.-> Uploads
+```
 
-### Prerequisites
-- Docker and Docker Compose
-- Google API key for Generative AI
-- 8GB+ RAM recommended
-- 10GB+ free disk space
+### Design decisions and why
 
-### 1. Clone the Repository
+- **Background processing with Celery and Redis.** Reading a PDF and calling an embedding API is slow. Doing it inside the web request would make uploads feel broken. A queue keeps the API quick and lets workers scale separately.
+- **PostgreSQL with pgvector instead of a dedicated vector database.** One database holds the data and the vectors. That means fewer moving parts to run, and a familiar tool for administration (pgAdmin is included).
+- **A separate MCP server for search.** Putting search behind MCP gives the AI a clean, standard tool interface. The chat agent and the data access are decoupled, so tools can be added or changed without rewriting the agent.
+- **Chunking before embedding.** Resumes are split into smaller passages so retrieval returns focused snippets instead of whole documents.
+- **Streaming responses.** Answers show up as they're generated, which feels far more responsive than waiting for the full reply.
+- **Docker Compose for everything.** Each service is containerized, with health checks, so the stack starts the same way on any machine.
+
+### Trade-offs
+
+- It's a multi-service system, so it needs more resources than a single script. The README recommends 8GB+ RAM and 10GB+ free disk.
+- It depends on a Google API key for both embeddings and the chat model.
+- Default credentials and dev-style settings are meant for local use, not production as-is.
+
+> **For the curious:** the README suggests an optional index for faster vector search on larger datasets:
+> ```sql
+> CREATE INDEX CONCURRENTLY ON documents USING ivfflat (embedding vector_cosine_ops);
+> ```
+
+### Tech stack
+
+| Layer | Technology | Role |
+|-------|-----------|------|
+| API | FastAPI | Upload and chat endpoints, streaming |
+| Background jobs | Celery + Redis | Asynchronous PDF processing |
+| Database | PostgreSQL + pgvector | Storage and vector similarity search |
+| AI framework | LangChain | Agent and model orchestration |
+| AI models | Google Generative AI | Embeddings (`models/embedding-001`) and chat (`gemini-2.0-flash-exp`) |
+| Tool protocol | FastMCP | MCP server exposing search |
+| Frontend | Next.js 15 (Turbopack), TypeScript, Tailwind CSS, React Markdown | Chat UI with markdown rendering |
+| Infrastructure | Docker, Docker Compose, Python 3.11+, Node.js 20, UV | Packaging and runtime |
+| Monitoring | Flower, pgAdmin | Task and database visibility |
+
+## Results and what I learned
+
+I don't have benchmark numbers to share, and I'd rather not invent any. What I can say is what the project delivers:
+
+- Multi-file PDF upload with drag and drop, processed asynchronously.
+- Semantic search over resume content, with chat history persisted and streamed markdown replies.
+- A full stack that runs from a single Compose command, with health checks and dashboards for the task queue and database.
+
+What I learned:
+
+- Anything slow belongs in a queue. It's the difference between an app that feels solid and one that feels broken.
+- MCP is a nice way to keep the AI's "hands" separate from its "brain".
+- Keeping vectors in Postgres keeps operations simple.
+
+## Try it yourself
+
+**Prerequisites:** Docker and Docker Compose, a Google API key for Generative AI, 8GB+ RAM recommended, 10GB+ free disk space.
+
+**1. Clone**
+
 ```bash
 git clone <repository-url>
 cd assignment
 ```
 
-### 2. Environment Configuration
+**2. Configure**
 
-#### FastAPI Server Configuration
 ```bash
 cp fastapi-server/.env.example fastapi-server/.env
 ```
 
 Edit `fastapi-server/.env`:
+
 ```env
 # Database Configuration
 PG_CONNECTION_STRING=postgresql://postgres:postgres@db:5432/resumedb
 
-# Redis/Celery Configuration  
+# Redis/Celery Configuration
 CELERY_BROKER_URL=redis://redis:6379/0
 CELERY_RESULT_BACKEND=redis://redis:6379/0
 
@@ -145,19 +193,22 @@ MODEL_NAME=gemini-2.0-flash-exp
 MODEL_PROVIDER=google_genai
 ```
 
-#### FastMCP Server Configuration
 ```bash
 cp fastmcp-server/.env.example fastmcp-server/.env
 ```
 
 Edit `fastmcp-server/.env`:
+
 ```env
 PG_CONNECTION_STRING=postgresql://postgres:postgres@db:5432/resumedb
 GOOGLE_API_KEY=your_google_api_key_here
 EMBEDDING_MODEL=models/embedding-001
 ```
 
-### 3. Launch the System
+The frontend reads `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`).
+
+**3. Launch**
+
 ```bash
 # Start all services
 docker-compose up -d
@@ -169,233 +220,31 @@ docker-compose logs -f
 docker-compose ps
 ```
 
-### 4. Access the Application
-
-Once all services are running, access:
+**4. Open the app**
 
 | Service | URL | Purpose |
 |---------|-----|---------|
-| **Main Application** | http://localhost:3000 | Frontend chat interface |
-| **API Documentation** | http://localhost:8000/docs | Swagger UI for API |
-| **Database Admin** | http://localhost:5050 | pgAdmin interface |
-| **Task Monitor** | http://localhost:5555 | Flower Celery dashboard |
-| **FastMCP Server** | http://localhost:8005 | MCP protocol endpoint |
+| Main Application | http://localhost:3000 | Frontend chat interface |
+| API Documentation | http://localhost:8000/docs | Swagger UI for API |
+| Database Admin | http://localhost:5050 | pgAdmin interface |
+| Task Monitor | http://localhost:5555 | Flower Celery dashboard |
+| FastMCP Server | http://localhost:8005 | MCP protocol endpoint |
 
-#### Default Credentials
-- **pgAdmin**: admin@admin.com / admin
-- **PostgreSQL**: postgres / postgres
+Default credentials (local use only): pgAdmin `admin@admin.com` / `admin`; PostgreSQL `postgres` / `postgres`.
 
+To tune the database, you can open a SQL shell with:
 
-## 🔧 Configuration & Customization
-
-### Environment Variables
-
-#### Core System
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PG_CONNECTION_STRING` | PostgreSQL connection URL | `postgresql://postgres:postgres@db:5432/resumedb` |
-| `CELERY_BROKER_URL` | Redis broker for Celery | `redis://redis:6379/0` |
-| `CELERY_RESULT_BACKEND` | Redis backend for Celery | `redis://redis:6379/0` |
-| `UPLOAD_DIR` | Directory for file uploads | `/tmp/resume_uploads` |
-
-#### AI Configuration
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `GOOGLE_API_KEY` | Google AI API key | **Required** |
-| `EMBEDDING_MODEL` | Embedding model name | `models/embedding-001` |
-| `MODEL_NAME` | Chat model name | `gemini-2.0-flash-exp` |
-| `MODEL_PROVIDER` | Model provider | `google_genai` |
-
-#### Frontend
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `NEXT_PUBLIC_API_URL` | Backend API URL | `http://localhost:8000` |
-
-
-
-#### Database Performance
 ```bash
-# Access PostgreSQL for optimization
 docker-compose exec db psql -U postgres -d resumedb
-
-# Create additional indexes for performance
-CREATE INDEX CONCURRENTLY ON documents USING ivfflat (embedding vector_cosine_ops);
 ```
 
-## 📁 Project Structure
+## What's next and limitations
 
-### 🏠 Root Directory
-```
-assignment/
-├── docker-compose.yaml
-├── README.md
-├── fastapi-server/
-├── fastmcp-server/
-└── next-frontend/
-```
+- The default credentials and settings are for local development. A production setup would need secrets management and hardening; the README sketches a Kubernetes deployment (3 replicas of the FastAPI server, port 8000) as a starting point.
+- Search quality and answers depend on the Google models configured.
+- Only PDF resumes are supported today.
 
-### 🖥️ FastAPI Server Structure
-```
-fastapi-server/
-├── app/
-│   ├── __init__.py
-│   ├── main.py
-│   ├── core.py
-│   ├── worker.py
-│   ├── config/
-│   │   ├── __init__.py
-│   │   └── settings.py
-│   ├── routes/
-│   │   ├── __init__.py
-│   │   ├── upload.py
-│   │   └── chat.py
-│   ├── schemas/
-│   │   ├── __init__.py
-│   │   ├── request.py
-│   │   └── chat.py
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   └── service.py
-│   ├── agents/
-│   │   ├── __init__.py
-│   │   └── mcp_agent.py
-│   └── utils/
-│       ├── __init__.py
-│       └── helpers.py
-├── __pycache__/
-├── Dockerfile
-├── requirements.txt
-├── pyproject.toml
-├── uv.lock
-└── README.md
-```
-```
-fastapi-server/
-├── 📁 app/                         # Main application package
-│   ├── 🐍 __init__.py             # Package initialization
-│   ├── 🐍 main.py                 # FastAPI application entry point
-│   ├── 🐍 core.py                 # Core FastAPI app configuration
-│   ├── ⚙️ worker.py               # Celery task definitions & worker
-│   │
-│   ├── � config/                  # Configuration management
-│   │   ├── 🐍 __init__.py         # Package initialization
-│   │   └── ⚙️ settings.py         # Environment variables & settings
-│   │
-│   ├── 📁 routes/                  # API endpoint definitions
-│   │   ├── 🐍 __init__.py         # Package initialization
-│   │   ├── 📤 upload.py           # File upload endpoints & logic
-│   │   └── 💬 chat.py             # Chat API endpoints & streaming
-│   │
-│   ├── 📁 schemas/                 # Pydantic models & validation
-│   │   ├── 🐍 __init__.py         # Package initialization
-│   │   ├── 📝 request.py          # API request/response models
-│   │   └── 💬 chat.py             # Chat-specific data schemas
-│   │
-│   ├── 📁 ingestion/               # Document processing pipeline
-│   │   ├── � __init__.py         # Package initialization
-│   │   └── 🔄 service.py          # PDF processing & vectorization
-│   │
-│   ├── 📁 agents/                  # AI agent management
-│   │   ├── 🐍 __init__.py         # Package initialization
-│   │   └── 🤖 mcp_agent.py        # MCP agent configuration & logic
-│   │
-│   └── 📁 utils/                   # Utility functions & helpers
-│       ├── 🐍 __init__.py         # Package initialization
-│       └── 🛠️ helpers.py          # File handling & common utilities
-│
-├── 📁 __pycache__/                 # Python bytecode cache
-├── 🐳 Dockerfile                   # Container configuration
-├── 📦 requirements.txt             # Python dependencies (pip)
-├── ⚙️ pyproject.toml              # Project metadata & dependencies (UV)
-├── 🔒 uv.lock                     # UV dependency lock file
-└── 📄 README.md                   # Service-specific documentation
-```
+## Links
 
-### 🔌 FastMCP Server Structure
-```
-fastmcp-server/
-├── server.py
-├── config.py
-├── __pycache__/
-├── Dockerfile
-├── requirements.txt
-├── pyproject.toml
-├── uv.lock
-└── README.md
-```
-
-### 🌐 Next.js Frontend Structure
-```
-next-frontend/
-├── src/
-│   ├── app/
-│   │   ├── globals.css
-│   │   ├── layout.tsx
-│   │   ├── page.tsx
-│   │   └── favicon.ico
-│   ├── components/
-│   │   └── ChatInterface.tsx
-│   └── utils/
-│       └── api.ts
-├── public/
-│   ├── file.svg
-│   ├── globe.svg
-│   ├── next.svg
-│   ├── vercel.svg
-│   └── window.svg
-├── Dockerfile
-├── package.json
-├── next.config.ts
-├── tsconfig.json
-├── next-env.d.ts
-├── eslint.config.mjs
-├── postcss.config.mjs
-└── README.md
-```
-
-## 🚀 Deployment Options
-
-### Production Deployment
-
-#### Kubernetes
-```yaml
-# Example deployment configuration
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: fastapi-server
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: fastapi-server
-  template:
-    metadata:
-      labels:
-        app: fastapi-server
-    spec:
-      containers:
-      - name: fastapi
-        image: resume-app/fastapi-server:latest
-        ports:
-        - containerPort: 8000
-```
-
-## 📚 Additional Resources
-
-### Documentation
-- [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [Next.js Documentation](https://nextjs.org/docs)
-- [LangChain Documentation](https://docs.langchain.com/)
-- [pgvector Documentation](https://github.com/pgvector/pgvector)
-- [Celery Documentation](https://docs.celeryproject.org/)
-
-### API References
-- [Google Generative AI API](https://ai.google.dev/docs)
-- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
-- [Redis Documentation](https://redis.io/documentation)
-
-### Community
-- [FastAPI Community](https://github.com/tiangolo/fastapi/discussions)
-- [LangChain Community](https://github.com/langchain-ai/langchain/discussions)
-- [Next.js Community](https://github.com/vercel/next.js/discussions)
+- Repository: https://github.com/AbQaadir/mcp-chat-bot
+- [FastAPI](https://fastapi.tiangolo.com/) · [Next.js](https://nextjs.org/docs) · [LangChain](https://docs.langchain.com/) · [pgvector](https://github.com/pgvector/pgvector) · [Celery](https://docs.celeryproject.org/) · [Google Generative AI](https://ai.google.dev/docs)
